@@ -11,17 +11,54 @@ from torch import (load as pt_load, set_printoptions, unique, device, cuda,
                    zeros, no_grad, abs as pt_abs, mean, as_tensor, save as
                    pt_save)
 from torch.utils.data import Dataset, DataLoader
-from torch.nn import Module, LSTM, Linear, CELU, SELU
+from torch.nn import Module, LSTM, Linear, CELU, SELU, Dropout
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam, lr_scheduler
 
 set_printoptions(precision=2, linewidth=150, sci_mode=False)
 
 device = device("cuda" if cuda.is_available() else "cpu")
-batch_size = 256
+print(device)
+batch_size = 503
 loader_shuffle = False
 columns = ['R', 'C', 'time_step', 'u_in', 'u_out', 'pressure']
-epochs = 2
+epochs = 1
+
+
+def fit_cluster_model_to_train(train_X, n_clusters=1000):
+    """Fit train y (pressure) cluster model"""
+    train_X, train_y = train_X.numpy()[:, 2:-1], train_X.numpy()[:, -1]
+    from sklearn.cluster import MiniBatchKMeans
+    try:
+        print('Using fitted Cluster model.')
+        mk = load('cluster_model.joblib')
+    except BaseException as e:
+        print('==>Error:', e)
+        print('Fitting Cluster Model...')
+        mk = MiniBatchKMeans(n_clusters)
+        mk.fit(train_X)
+        print('Fitted.')
+        dump(mk, 'cluster_model.joblib')
+    pred = mk.predict(train_X)
+    res = column_stack((pred, train_y))
+    res = DataFrame(res, columns=['cluster', 'pressure'])
+    res = res.pivot_table(index='cluster', values='pressure', aggfunc='mean')
+    return mk, res
+
+
+train_raw = read_csv('/kaggle/input/ventilator-pressure-prediction/train.csv')
+train_raw = as_tensor(train_raw.to_numpy()).float()
+train_raw.shape
+
+test_raw = read_csv('/kaggle/input/ventilator-pressure-prediction/test.csv')
+test_raw = as_tensor(test_raw.to_numpy()).float()
+test_raw.shape
+
+cl_model, cl_to_press = fit_cluster_model_to_train(train_raw)
+cl_model, cl_to_press
+
+s = test_raw.shape[0]
+print(list(div for div in range(256, 1024) if s % (div * 80) == 0))
 
 
 class DS(Dataset):
@@ -49,56 +86,6 @@ class DS(Dataset):
             return X.float()
 
 
-train_raw = read_csv('/kaggle/input/ventilator-pressure-prediction//train.csv')
-train_raw = as_tensor(train_raw.to_numpy()).float()
-train_raw
-
-test_raw = read_csv('/kaggle/input/ventilator-pressure-prediction//test.csv')
-test_raw = as_tensor(test_raw.to_numpy()).float()
-test_raw
-
-
-def fit_cluster_model_to_train(train_X, n_clusters=1000):
-    """Fit train y (pressure) cluster model"""
-    train_X, train_y = train_X.numpy()[:, 2:-1], train_X.numpy()[:, -1]
-    from sklearn.cluster import MiniBatchKMeans
-    try:
-        print('Using fitted Cluster model.')
-        mk = load('cluster_model.joblib')
-    except BaseException as e:
-        print('==>Error:', e)
-        print('Fitting Cluster Model...')
-        mk = MiniBatchKMeans(n_clusters)
-        mk.fit(train_X)
-        print('Fitted.')
-        dump(mk, 'cluster_model.joblib')
-    pred = mk.predict(train_X)
-    res = column_stack((pred, train_y))
-    res = DataFrame(res, columns=['cluster', 'pressure'])
-    res = res.pivot_table(index='cluster', values='pressure', aggfunc='mean')
-    return mk, res
-
-
-cl_model, cl_to_press = fit_cluster_model_to_train(train_raw)
-cl_model, cl_to_press
-
-def predict_cluster_to_y_value(batch_X, cluster_model, cluster_to_pressure,
-                               batch_size, device):
-    tens = []
-    for batch in batch_X:
-        res = cluster_model.predict(batch)
-        res = DataFrame(res, columns=['cluster'])
-        res = merge(res,
-                    cluster_to_pressure,
-                    left_on='cluster',
-                    right_on='cluster')
-        tens.append(res['pressure'].tolist())
-    tens = as_tensor(tens)
-    tens = tens.reshape(batch_size, 80, 1)
-    tens = tens.to(device)
-    return tens
-
-
 train_ds = DS(train_raw)
 test_ds = DS(test_raw, train_data=False)
 # train_ds = iter(train_ds)
@@ -109,12 +96,12 @@ train_dl = DataLoader(train_ds,
                       batch_size=batch_size,
                       shuffle=loader_shuffle,
                       drop_last=True,
-                      num_workers=0)
+                      num_workers=-1)
 test_dl = DataLoader(test_ds,
                      batch_size=batch_size,
                      shuffle=loader_shuffle,
-                     drop_last=True,
-                     num_workers=0)
+                     drop_last=False,
+                     num_workers=-1)
 # train_dl = iter(train_dl)
 # batch = next(train_dl)
 # X_, y_ = batch
@@ -135,7 +122,7 @@ class NN(Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        # self.dropout = dropout
+        self.dropout = Dropout(0.1)
         self.device = device
         self.batch_size = batch_size
         self.activ = SELU()
@@ -168,8 +155,12 @@ class NN(Module):
     def forward(self, x, h, c, y):
         res, (h, c) = self.lstm(x, (h, c))
         res = self.activ(res)
+        # TODO add dropout
+        res = self.dropout(res)
         res = self.activ(self.linear(res))
         err = res - y
+        # TODO add dropout
+        res = self.dropout(res)
         res -= self.linear2(err)
         return res
 
@@ -194,7 +185,6 @@ lambda1 = lambda epoch: 0.999**epoch
 scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
 
 # Train
-start = perf_counter()
 for epoch in range(epochs):
     batches_loss = []
     h = net.init_h()
@@ -222,19 +212,43 @@ for epoch in range(epochs):
     pt_save(net.state_dict(),
             f'trained_model_MAE_{mean(as_tensor(batches_loss)):.2f}.pth')
 
+
+def predict_cluster_to_y_value(batch_X, cluster_model, cluster_to_pressure,
+                               device):
+    tens = []
+    for batch in batch_X:
+        res = cluster_model.predict(batch)
+        res = DataFrame(res, columns=['cluster'])
+        res = merge(res,
+                    cluster_to_pressure,
+                    left_on='cluster',
+                    right_on='cluster')
+        tens.append(res['pressure'].tolist())
+    tens = as_tensor(tens)
+    tens = tens.reshape(tens.shape[0], 80, 1)
+    tens = tens.to(device)
+    return tens
+
+
 # Inference
 with no_grad():
+    net.train(False)
     subm = []
     step = 0
-    for X in tqdm(test_dl):
+    for i, X in enumerate(test_dl):
         y = predict_cluster_to_y_value(X.numpy(), cl_model, cl_to_press,
-                                       batch_size, device)
-        out = net(X.float().cuda(), h, c, y) * 10  #un-pseudo normalize for inference
+                                       device)
+        out = net(X.float().cuda(), h, c,
+                  y) * 10  # un-pseudo normalize for inference
         out = out.reshape(out.shape[0] * out.shape[1], 1)
         subm.append(out.cpu().numpy())
         step += 1
 
-    subm = DataFrame(subm[0], index=range(1, subm[0].shape[0] + 1))
-    subm = subm.reset_index()
-    subm.columns = ['id', 'pressure']
-    subm.to_csv('submission.csv', index=False)
+# Submission
+subm = DataFrame([float(pred) for arr in subm for pred in arr])
+subm.index = range(1, subm.shape[0] + 1)
+subm = subm.reset_index()
+subm.columns = ['id', 'pressure']
+subm
+
+subm.to_csv('submission.csv', index=False)
